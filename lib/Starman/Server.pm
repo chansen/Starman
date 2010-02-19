@@ -249,48 +249,57 @@ sub _read_headers {
 
         alarm( READ_TIMEOUT );
 
+        my $bref = \$self->{client}->{inputbuf};
+        my $sock = $self->{server}->{client};
+
         while (1) {
             # Do we have a full header in the buffer?
             # This is before sysread so we don't read if we have a pipelined request
             # waiting in the buffer
-            last if $self->{client}->{inputbuf} =~ /$CRLF$CRLF/s;
+            my $eoh = index($$bref, CRLF . CRLF);
+            if ($eoh > 0) {
+                $self->{client}->{headerbuf} = substr($$bref, 0, $eoh + 4, '');
+                last;
+            }
+            elsif (length $$bref > 1024 * 32) {
+                die "Request Entity Too Large: size of header exceeds maximum allowed (32K)\n";
+            }
 
             # If not, read some data
-            my $read = sysread $self->{server}->{client}, my $buf, CHUNKSIZE;
+            my $read = sysread($sock, $$bref, CHUNKSIZE, length $$bref);
 
             if ( !defined $read || $read == 0 ) {
                 die "Read error: $!\n";
             }
 
             if ( DEBUG ) {
-                warn "[$$] Read $read bytes: " . dump($buf) . "\n";
+                warn "[$$] Read $read bytes: " . dump(substr($$bref, -$read)) . "\n";
             }
-
-            $self->{client}->{inputbuf} .= $buf;
         }
     };
 
     alarm(0);
 
     if ( $@ ) {
-        if ( $@ =~ /Timed out/ ) {
+        if ( $@ =~ /^Timed out/ ) {
             DEBUG && warn "[$$] Client connection timed out\n";
             return;
         }
 
-        if ( $@ =~ /Read error/ ) {
+        if ( $@ =~ /^Read error/ ) {
             DEBUG && warn "[$$] Read error: $!\n";
+            return;
+        }
+
+        if ( $@ =~ /^Request Entity Too Large/ ) {
+            DEBUG && warn "[$$] $@";
+            # 413 Request Entity Too Large
+            $self->_http_error(413, { SERVER_PROTOCOL => "HTTP/1.0" });
             return;
         }
     }
 
-    # Pull out the complete header into a new buffer
-    $self->{client}->{headerbuf} = $self->{client}->{inputbuf};
-
-    # Save any left-over data, possibly body data or pipelined requests
-    $self->{client}->{inputbuf} =~ s/.*?$CRLF$CRLF//s;
-
-    return 1;
+    return !!$self->{client}->{headerbuf};
 }
 
 sub _http_error {
@@ -313,8 +322,9 @@ sub _prepare_env {
     my($self, $env) = @_;
 
     my $get_chunk = sub {
-        if ($self->{client}->{inputbuf}) {
-            my $chunk = delete $self->{client}->{inputbuf};
+        if (length $self->{client}->{inputbuf}) {
+            my $chunk = $self->{client}->{inputbuf};
+            $self->{client}->{inputbuf} = '';
             return ($chunk, length $chunk);
         }
         my $read = sysread $self->{server}->{client}, my($chunk), CHUNKSIZE;
